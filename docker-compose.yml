@@ -1,0 +1,15 @@
+version: '3.9'
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - TZ=Africa/Nairobi
+      - DB_SERVER=208.64.33.61        # still points to your real remote DB
+      - DB_PORT=1433
+      - DB_NAME=Ridgeways
+      - DB_USER=Masinde
+      - DB_PASSWORD=qwerty@123#
+      - DB_DRIVER=ODBC Driver 17 for SQL Server
+    restart: always
