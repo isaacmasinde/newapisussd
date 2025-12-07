@@ -7,6 +7,7 @@ import http.client
 import math
 from typing import Tuple, Optional
 from urllib.parse import parse_qs
+import pytz
 
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse
@@ -33,7 +34,14 @@ if SENTRY_DSN:
         profile_session_sample_rate=1.0,
     )
 
-app = FastAPI()
+# Ensure OpenAPI and docs endpoints are enabled explicitly so Redoc/Swagger are available.
+# ReDoc loads its JS bundle from the internet; if you're offline or behind a restrictive proxy
+# the page may appear blank. Use a local ReDoc HTML if needed.
+app = FastAPI(
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json"
+)
 
 # Regex patterns compiled once for efficiency
 PATTERN_INITIAL = re.compile(r"^98$")
@@ -58,6 +66,9 @@ ADDITIONAL_HOUR_COST = 50  # KES per hour
 # Day/night boundaries as module-level constants to avoid recreating time() objects repeatedly
 DAY_START = datetime.time(6, 0, 0)
 DAY_END = datetime.time(22, 0, 0)
+
+# Define timezone constant (Kenya is EAT/UTC+3)
+EAT = pytz.timezone('Africa/Nairobi')
 
 
 def link_phone_to_vehicle(carno: str, phone: str) -> None:
@@ -180,21 +191,12 @@ def compute_parking_fee(entry_dt: datetime.datetime, exit_dt: datetime.datetime)
 
 def get_vehicle_transaction(carno: str) -> Optional[Tuple]:
     """Get the most recent transaction for a vehicle.
-    
+
     Queries the transactions table for the latest entry by vehicle number.
     Used to retrieve parking start time and transaction ID.
-    
-    Args:
-        carno: Vehicle registration number
-        
-    Returns:
-        Tuple of (transaction_id, time_in) or None if vehicle not found
-        
-    Example:
-        >>> result = get_vehicle_transaction("KCA123A")
-        >>> if result:
-        ...     tx_id, entry_time = result
-        ...     duration = (now - entry_time).total_seconds() // 60
+
+    Returns a tuple (transaction_id, time_in) where time_in is timezone-aware
+    (localized to EAT) to avoid naive/aware datetime arithmetic errors.
     """
     try:
         with get_cursor() as cursor:
@@ -202,7 +204,22 @@ def get_vehicle_transaction(carno: str) -> Optional[Tuple]:
                 SELECT TOP 1 id, time_in FROM transactions
                 WHERE vehicle_number = ? ORDER BY time_in DESC
             """, carno)
-            return cursor.fetchone()
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            tx_id, time_in = row[0], row[1]
+
+            # If time_in is a naive datetime, localize it to EAT to avoid TypeError
+            # when subtracting from now_dt (which is timezone-aware).
+            if isinstance(time_in, datetime.datetime) and time_in.tzinfo is None:
+                try:
+                    time_in = EAT.localize(time_in)
+                except Exception:
+                    # Fallback: if localization fails, leave as-is and log a warning
+                    logger.warning(f"Failed to localize time_in for tx {tx_id}; time_in={time_in}")
+
+            return (tx_id, time_in)
     except Exception as e:
         logger.error(f"Failed to get transaction for {carno}: {str(e)}")
         return None
@@ -284,16 +301,15 @@ async def ussd(request: Request):
     # phone normalization: try common keys
     phone = str(params.get("MSISDN") or params.get("msisdn") or params.get("From") or "").lstrip("+")
     # compute timestamp once per request to avoid repeated datetime.now() calls
-    now_dt = datetime.datetime.now()  # Keep as naive, database will be naive too
+    now_dt = datetime.datetime.now(EAT)  # Use EAT timezone
 
     try:
         if PATTERN_INITIAL.match(text):
             # unified first page; no separate RNG entry here
             response = (
                 "CON Welcome to SyfePark USSD!\n"
-                "By paying with USSD you agree with below terms\n"
                 "1. Pay for Parking\n2. Check Amount Due\n3. Check Time Stayed\n4. Terms & Conditions\n"
-                "Note: Vehicles managed by RNG (external) only support Amount checks via option 2."
+                "Note: RNG-managed vehicles support amount checks only (option 2)."
             )
 
         elif PATTERN_PAY_MENU.match(text):
@@ -321,34 +337,24 @@ async def ussd(request: Request):
 
         elif PATTERN_AMOUNT_MENU.match(text):
             response = "CON Enter your Plate Number"
-
         elif PATTERN_AMOUNT_INPUT.match(text):
             carno = PATTERN_AMOUNT_INPUT.match(text).group(1).upper().replace(" ", "")
-            # Determine provider ownership first
-            if is_rng_vehicle(carno):
-                # RNG-managed: use RNG-specific function for amount only
-                try:
-                    amount = rng_check_parking_fee_due(carno)
-                except Exception as e:
-                    logger.error(f"RNG amount lookup failed for {carno}: {e}")
-                    response = "END An error occurred. Please try again."
-                else:
-                    response = f"END Your amount due for {carno} is KES {amount}" if amount else f"END No charge for {carno}. Within free time."
+            # Always use Ridgeways compute_parking_fee for amount checks
+            link_phone_to_vehicle(carno, phone)
+            transaction = get_vehicle_transaction(carno)
+            if not transaction:
+                response = "END Vehicle not found!"
             else:
-                # Ridgeways-managed: proceed with existing flow (link phone then compute)
-                link_phone_to_vehicle(carno, phone)
-                transaction = get_vehicle_transaction(carno)
-                if not transaction:
-                    response = "END Vehicle not found!"
-                else:
-                    entry_dt = transaction[1]
-                    # Don't try to localize, keep both naive
-                    logger.info(f"=== AMOUNT DEBUG for {carno} ===")
-                    logger.info(f"entry_dt: {entry_dt}")
-                    logger.info(f"now_dt: {now_dt}")
-                    logger.info(f"Duration: {(now_dt - entry_dt).total_seconds() / 60} minutes")
-                    cost = compute_parking_fee(entry_dt, now_dt)
-                    response = f"END Amount due: KES {cost}" if cost else f"END No charge. Within free time."
+                entry_dt = transaction[1]
+                # Ensure entry_dt is timezone-aware (if it's naive, assume EAT)
+                if entry_dt.tzinfo is None:
+                    entry_dt = EAT.localize(entry_dt)
+                logger.info(f"=== AMOUNT DEBUG for {carno} ===")
+                logger.info(f"entry_dt: {entry_dt}")
+                logger.info(f"now_dt: {now_dt}")
+                logger.info(f"Duration: {(now_dt - entry_dt).total_seconds() / 60} minutes")
+                cost = compute_parking_fee(entry_dt, now_dt)
+                response = f"END Amount due: KES {cost}" if cost else f"END No charge. Within free time."
 
         elif PATTERN_TIME_MENU.match(text):
             response = "CON Enter your Plate Number"
